@@ -68,7 +68,7 @@ class AnchorGenerator(object):
         # check center and center_offset
         if center_offset != 0:
             assert centers is None, 'center cannot be set when center_offset' \
-                f'!=0, {centers} is given.'
+                                    f'!=0, {centers} is given.'
         if not (0 <= center_offset <= 1):
             raise ValueError('center_offset should be in range [0, 1], '
                              f'{center_offset} is given.')
@@ -87,14 +87,14 @@ class AnchorGenerator(object):
 
         # calculate scales of anchors
         assert ((octave_base_scale is not None
-                and scales_per_octave is not None) ^ (scales is not None)), \
+                 and scales_per_octave is not None) ^ (scales is not None)), \
             'scales and octave_base_scale with scales_per_octave cannot' \
             ' be set at the same time'
         if scales is not None:
             self.scales = torch.Tensor(scales)
         elif octave_base_scale is not None and scales_per_octave is not None:
             octave_scales = np.array(
-                [2**(i / scales_per_octave) for i in range(scales_per_octave)])
+                [2 ** (i / scales_per_octave) for i in range(scales_per_octave)])
             scales = octave_scales * octave_base_scale
             self.scales = torch.Tensor(scales)
         else:
@@ -395,6 +395,73 @@ class SSDAnchorGenerator(AnchorGenerator):
         repr_str += f'{indent_str}base_sizes={self.base_sizes},\n'
         repr_str += f'{indent_str}basesize_ratio_range='
         repr_str += f'{self.basesize_ratio_range})'
+        return repr_str
+
+
+@ANCHOR_GENERATORS.register_module()
+class YOLOAnchorGenerator(AnchorGenerator):
+    """Anchor generator for YOLO
+    Args:
+        strides (list[int] | list[tuple[int, int]]): Strides of anchors
+            in multiple feature levels
+        mlvl_sizes (list[list(list[int, int]])): Sizes(w, h) of anchors in multiple
+            feature levels
+    """
+
+    def __init__(self,
+                 strides: list,
+                 mlvl_sizes: list,
+                 device="cuda"):
+        assert len(strides) == len(mlvl_sizes)
+        self.strides = [_pair(stride) for stride in strides]
+        self.mlvl_sizes = torch.Tensor(mlvl_sizes).to(device)
+        self.base_anchors = self.mlvl_sizes
+
+
+    def grid_anchors(self, featmap_sizes, device='cuda'):
+        """Generate grid anchors in multiple feature levels
+
+        Args:
+            featmap_sizes (list[tuple]): List of feature map sizes in
+                multiple feature levels.
+            device (str): Device where the anchors will be put on.
+
+        Return:
+            list[torch.Tensor]: Anchors in multiple feature levels.
+                The sizes of each tensor should be [N, 4], where
+                N = width * height * num_base_anchors, width and height
+                are the sizes of the corresponding feature lavel,
+                num_base_anchors is the number of anchors for that level.
+        """
+        assert self.num_levels == len(featmap_sizes)
+        multi_level_anchors = []
+        for i in range(self.num_levels):
+            anchors = self.single_level_grids(
+                self.base_anchors[i].to(device),
+                featmap_sizes[i],
+                self.strides[i],
+                device=device)
+            multi_level_anchors.append(anchors)
+        return multi_level_anchors
+
+    def single_level_grids(self,
+                           base_anchors,
+                           featmap_size,
+                           stride=(16, 16),
+                           device='cuda'):
+        feat_h, feat_w = featmap_size
+        shift_x = torch.arange(0, feat_w, device=device) * stride[0]
+        shift_y = torch.arange(0, feat_h, device=device) * stride[1]
+        shift_xx, shift_yy = self._meshgrid(shift_x, shift_y)
+        shifts = torch.stack([shift_xx, shift_yy], dim=-1)
+        shifts = shifts.type_as(base_anchors)
+        return shifts
+
+    def __repr__(self):
+        indent_str = '    '
+        repr_str = self.__class__.__name__ + '(\n'
+        repr_str += f'{indent_str}strides={self.strides},\n'
+        repr_str += f'{indent_str}mlv_sizes={self.mlv_sizes},\n'
         return repr_str
 
 

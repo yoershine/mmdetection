@@ -1,128 +1,133 @@
 import torch
+from torch import layer_norm
 import torch.nn as nn
 import torch.nn.functional as F
-from mmcv.cnn import ConvModule, xavier_init
+from torch.nn.modules.batchnorm import _BatchNorm
+
+from mmcv.cnn import ConvModule, build_upsample_layer, xavier_init, constant_init
 
 from ..builder import NECKS
 
 
-class DetectionNeck(nn.Module):
-    """
-    Let out_channels = n, the DetectionBlock contains:
-    Six ConvLayers, 1 Conv2D Layer and 1 YoloLayer.
-    The first 6 ConvLayers are formed the following way:
-        1x1xn, 3x3x2n, 1x1xn, 3x3x2n, 1x1xn, 3x3x2n.
-    The Conv2D layer is 1x1x255.
-    Some block will have branch after the fifth ConvLayer.
-    The input channel is arbitrary (in_channels)
+class RefineBlock(nn.Module):
+    """ RefineBlock, contains 4 conv layers
+        in => Conv_3x3_2*in => Conv_1x1_in => Conv_3x3_2*in => Conv_1x1_in
     Args:
-        in_channels (int): The number of input channels.
-        out_channels (int): The number of output channels.
+        channels (int): input channels
         conv_cfg (dict): Config dict for convolution layer. Default: None.
-        norm_cfg (dict): Dictionary to construct and config norm layer.
-            Default: dict(type='BN', requires_grad=True)
-        act_cfg (dict): Config dict for activation layer.
-            Default: dict(type='LeakyReLU', negative_slope=0.1).
+        norm_cfg (dict): Config dict for norm layer. Default: None.
+        act_cfg (dict): Config dict for activation layer. Default: None.
     """
-
-    def __init__(self,
-                 in_channels,
-                 out_channels,
+    def __init__(self, 
+                 channels,
                  conv_cfg=None,
-                 norm_cfg=dict(type='BN', requires_grad=True),
-                 act_cfg=dict(type='LeakyReLU', negative_slope=0.1)):
-        super(DetectionNeck, self).__init__()
-        double_out_channels = out_channels * 2
-
-        # shortcut
+                 norm_cfg=None,
+                 act_cfg=None) -> None:
+        super(RefineBlock, self).__init__()
+        layers = []
+        layer_nums = 4
         cfg = dict(conv_cfg=conv_cfg, norm_cfg=norm_cfg, act_cfg=act_cfg)
-        self.conv1 = ConvModule(in_channels, out_channels, 1, **cfg)
-        self.conv2 = ConvModule(
-            out_channels, double_out_channels, 3, padding=1, **cfg)
-        self.conv3 = ConvModule(double_out_channels, out_channels, 1, **cfg)
-        self.conv4 = ConvModule(
-            out_channels, double_out_channels, 3, padding=1, **cfg)
-        self.conv5 = ConvModule(double_out_channels, out_channels, 1, **cfg)
+        for i in range(layer_nums):
+            if i % 2 == 0:
+                layers.append(ConvModule(channels, channels * 2, 3, padding=1, **cfg))
+            else:
+                layers.append(ConvModule(channels * 2, channels, 1, **cfg))
 
+        self.layers = nn.Sequential(*layers)
+    
     def forward(self, x):
-        tmp = self.conv1(x)
-        tmp = self.conv2(tmp)
-        tmp = self.conv3(tmp)
-        tmp = self.conv4(tmp)
-        out = self.conv5(tmp)
-        return out
+        return self.layers(x)
 
 
 @NECKS.register_module()
 class YOLOV3Neck(nn.Module):
-    """The neck of YOLOV3. It can be treated as a simplified version of FPN. It
-    will take the result from Darknet backbone and do some upsampling and
-    concatenation. It will finally output the detection result.
-    Note:
-        The input feats should be from top to bottom.
-            i.e., from high-lvl to low-lvl
-        But YOLOV3Neck will process them in reversed order.
-            i.e., from bottom (high-lvl) to top (low-lvl)
-    Args:
-        num_scales (int): The number of scales / stages.
-        in_channels (int): The number of input channels.
-        out_channels (int): The number of output channels.
-        conv_cfg (dict): Config dict for convolution layer. Default: None.
-        norm_cfg (dict): Dictionary to construct and config norm layer.
-            Default: dict(type='BN', requires_grad=True)
-        act_cfg (dict): Config dict for activation layer.
-            Default: dict(type='LeakyReLU', negative_slope=0.1).
-    """
+    """ YOLOV3 Neck
 
+    C3 -> cat(C4_Refine_Upsample, C3) -> C3_Lateral -> C3_Refine -> C3_Final -> C3_Output
+    C4 -> cat(C5_Refine_Upsample, C4) -> C4_Lateral -> C4_Refine -> C4_Final -> C4_Output 
+    C5 -> C5_lateral -> C5_Refine -> C5_Final -> C5_Output
+
+    Args:
+        in_channels (List(int)): List of input channels
+        out_channels (List(int)): List of output channels
+        conv_cfg (dict): Config dict for convolution layer. Default: None.
+        norm_cfg (dict): Config dict for norm layer. Default: None.
+        act_cfg (dict): Config dict for activation layer. Default: None.      
+    """
     def __init__(self,
-                 num_scales,
                  in_channels,
                  out_channels,
                  conv_cfg=None,
-                 norm_cfg=dict(type='BN', requires_grad=True),
-                 act_cfg=dict(type='LeakyReLU', negative_slope=0.1)):
+                 norm_cfg=None,
+                 act_cfg=None,
+                 upsample_cfg=None) -> None:
         super(YOLOV3Neck, self).__init__()
-        assert (num_scales == len(in_channels) == len(out_channels))
-        self.num_scales = num_scales
+        assert isinstance(in_channels, list)
+        assert isinstance(out_channels, list)
+        assert len(in_channels) == len(out_channels)
+
         self.in_channels = in_channels
         self.out_channels = out_channels
+        self.num_ins = len(in_channels)
+        self.upsample_cfg = upsample_cfg.copy()
 
-        # shortcut
+        # build lateral convs
+        self.lateral_convs = nn.ModuleList()
+        self.upsample_modules = nn.ModuleList()
+        self.refine_modules = nn.ModuleList()
+        self.final_convs = nn.ModuleList()
+
         cfg = dict(conv_cfg=conv_cfg, norm_cfg=norm_cfg, act_cfg=act_cfg)
+        for i in range(self.num_ins):
+            lateral_inc = in_channels[i] + (out_channels[i + 1] if i + 1 < self.num_ins else 0)
+            l_conv = ConvModule(lateral_inc, out_channels[i], 1, **cfg)
+            
+            if i > 0:
+                upsample_cfg_ = self.upsample_cfg.copy()
+                # suppress warnings
+                align_corners = (None
+                                 if self.upsample_cfg.type == 'nearest' else False)
+                upsample_cfg_.update(
+                    scale_factor=2,
+                    mode=self.upsample_cfg,
+                    align_corners=align_corners)
+                upsample_module = build_upsample_layer(upsample_cfg_)
+                self.upsample_modules.append(upsample_module)
+            else:
+                self.upsample_modules.append(None)
 
-        # To support arbitrary scales, the code looks awful, but it works.
-        # Better solution is welcomed.
-        self.detect1 = DetectionNeck(in_channels[0], out_channels[0], **cfg)
-        for i in range(1, self.num_scales):
-            in_c, out_c = self.in_channels[i], self.out_channels[i]
-            self.add_module(f'conv{i}', ConvModule(in_c, out_c, 1, **cfg))
-            # in_c + out_c : High-lvl feats will be cat with low-lvl feats
-            self.add_module(f'detect{i+1}',
-                            DetectionNeck(in_c + out_c, out_c, **cfg))
+            refine_block = RefineBlock(out_channels[i], **cfg)
 
-    def forward(self, feats):
-        assert len(feats) == self.num_scales
+            final_conv = ConvModule(out_channels[i], out_channels[i] * 2, 3, padding=1, **cfg)
 
-        outs = []
-        out = self.detect1(feats[-1])
-        outs.append(out)
-
-        # processed from bottom (high-lvl) to top (low-lvl)
-        for i, x in enumerate(feats[1::-1]):
-            conv = getattr(self, f'conv{i+1}')
-            tmp = conv(out)
-
-            # Cat with low-lvl feats
-            tmp = F.interpolate(tmp, scale_factor=2)
-            tmp = torch.cat((tmp, x), 1)
-
-            detect = getattr(self, f'detect{i+2}')
-            out = detect(tmp)
-            outs.append(out)
-
-        return tuple(outs)
+            self.lateral_convs.append(l_conv)
+            self.refine_modules.append(refine_block)
+            self.final_convs.append(final_conv)
 
     def init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 xavier_init(m, distribution='uniform')
+            elif isinstance(m, (_BatchNorm, nn.GroupNorm)):
+                constant_init(m, 1)   
+
+    def forward(self, inputs):
+        assert len(inputs) == self.num_ins
+
+        laterals = []
+        # build top-down path, ie. high-level => low-level
+        # calculate highest level feats
+        feats = self.refine_modules[-1](self.lateral_convs[-1](inputs[-1]))
+        laterals.append(feats)
+
+        for i in range(self.num_ins - 1, 0, -1):
+            upsample_feats = self.upsample_modules[i](feats)
+            cat_feats = torch.cat((upsample_feats, inputs[i - 1]), dim=1)
+            feats = self.refine_modules[i - 1](self.lateral_convs[i - 1](cat_feats))
+            laterals.append(feats)
+        
+        # Reverse feats orders
+        laterals = laterals[::-1]
+
+        outs = [final_conv(laterals[i]) for i, final_conv in enumerate(self.final_convs)]
+        return tuple(outs)

@@ -49,7 +49,6 @@ class YOLOV3HeadX(BaseDenseHead):
                  num_scales,
                  num_anchors_per_scale,
                  in_channels,
-                 out_channels,
                  strides,
                  anchor_base_sizes,
                  ignore_thresh=0.5,
@@ -62,7 +61,7 @@ class YOLOV3HeadX(BaseDenseHead):
                  test_cfg=None):
         super(YOLOV3HeadX, self).__init__()
         # Check params
-        assert (num_scales == len(in_channels) == len(out_channels) ==
+        assert (num_scales == len(in_channels) ==
                 len(strides) == len(anchor_base_sizes))
         for anchor_base_size in anchor_base_sizes:
             assert (len(anchor_base_size) == num_anchors_per_scale)
@@ -73,7 +72,6 @@ class YOLOV3HeadX(BaseDenseHead):
         self.num_scales = num_scales
         self.num_anchors_per_scale = num_anchors_per_scale
         self.in_channels = in_channels
-        self.out_channels = out_channels
         self.strides = strides
         self.anchor_base_sizes = anchor_base_sizes
 
@@ -86,15 +84,10 @@ class YOLOV3HeadX(BaseDenseHead):
         self.last_layer_dim = self.num_anchors_per_scale * self.num_attrib
 
         cfg = dict(norm_cfg=norm_cfg, act_cfg=act_cfg)
-        self.convs_bridge = nn.ModuleList()
         self.convs_final = nn.ModuleList()
         for i_scale in range(self.num_scales):
             in_c = self.in_channels[i_scale]
-            out_c = self.out_channels[i_scale]
-            conv_bridge = ConvModule(in_c, out_c, 3, padding=1, **cfg)
-            conv_final = nn.Conv2d(out_c, self.last_layer_dim, 1, bias=True)
-
-            self.convs_bridge.append(conv_bridge)
+            conv_final = nn.Conv2d(in_c, self.last_layer_dim, 1, bias=True)
             self.convs_final.append(conv_final)
 
         self.train_cfg = train_cfg
@@ -107,10 +100,10 @@ class YOLOV3HeadX(BaseDenseHead):
 
     def forward(self, feats):
         assert len(feats) == self.num_scales
+        feats = feats[::-1]
         results = []
         for i in range(self.num_scales):
             x = feats[i]
-            x = self.convs_bridge[i](x)
             out = self.convs_final[i](x)
             results.append(out)
 

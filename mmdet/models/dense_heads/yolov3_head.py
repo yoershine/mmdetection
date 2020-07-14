@@ -1,13 +1,10 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.nn.modules.utils import _pair
-import numpy as np
 
 from mmdet.core.bbox.iou_calculators import build_iou_calculator
 from mmcv.cnn import xavier_init, constant_init, ConvModule
 
-from mmdet.core import (build_assigner, build_sampler, multi_apply, force_fp32, multiclass_nms)
+from mmdet.core import (multi_apply, force_fp32, multiclass_nms)
 from ..builder import HEADS, build_loss
 from .base_dense_head import BaseDenseHead
 
@@ -21,6 +18,7 @@ class YOLOV3Head(BaseDenseHead):
                              [(30, 61), (62, 45), (59, 119)],
                              [(116, 90), (156, 198), (373, 326)]],
                  mlvl_strides=[8, 16, 32],
+                 iou_calculator = dict(type="BboxOverlaps2D"),
                  ignore_iou_thr=0.5,
                  eps=1e-6,
                  background_label=None,
@@ -67,7 +65,6 @@ class YOLOV3Head(BaseDenseHead):
         self.mlvl_anchors = self._generate_mlvl_anchors(mlvl_sizes)
         self.mlvl_strides = mlvl_strides
 
-        iou_calculator = dict(type="BboxOverlaps2D")
         self.iou_calculator = build_iou_calculator(iou_calculator)
 
         self.train_cfg = train_cfg
@@ -80,24 +77,15 @@ class YOLOV3Head(BaseDenseHead):
     def _init_layers(self):
         """Initialize layers of the head."""
         num_anchors = [anchor.size(0) for anchor in self.mlvl_anchors]
-        bridge_convs = []
         final_convs = []
-
         for i in range(self.num_levels):
             output_dim = num_anchors[i] * self.out_channels
-            bridge_convs.append(
-                ConvModule(self.in_channels[i], self.in_channels[i],
-                           kernel_size=3, stride=1, padding=1,
-                           norm_cfg=self.norm_cfg, act_cfg=self.act_cfg)
-            )
             final_convs.append(
                 ConvModule(self.in_channels[i], output_dim,
                            kernel_size=1, stride=1, padding=0,
                            norm_cfg=None, act_cfg=None)
             )
-        self.bridge_convs = nn.ModuleList(bridge_convs)
         self.final_convs = nn.ModuleList(final_convs)
-
 
     def init_weights(self):
         for m in self.modules():
@@ -108,8 +96,8 @@ class YOLOV3Head(BaseDenseHead):
 
     def forward(self, feats):
         preds = []
-        for feat, bridge_conv, final_conv in zip(feats, self.bridge_convs, self.final_convs):
-            preds.append(final_conv(bridge_conv(feat)))
+        for feat, final_conv in zip(feats, self.final_convs):
+            preds.append(final_conv(feat))
         return (tuple(preds), )
 
 
